@@ -1,0 +1,335 @@
+Add an option to specify a branch prefix.
+
+---
+
+<task-notification>
+<task-id>a636f8d200f326f8f</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-georgf-src-entireio-forgemark/072cb62a-52e2-4aa1-98b5-cb46644915e1/tasks/a636f8d200f326f8f.output</output-file>
+<status>completed</status>
+<summary>Agent "Explore flags and branch naming" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have a complete picture. Here are my findings.
+
+## Overview
+
+ForgeMark is a single-package Go CLI (`package main`) living entirely under `/Users/georgf/src/entireio/forgemark/cmd/forgemark/`. It's a concurrent git-push load generator built on `go-git/v6`. There is no internal package split — all logic is in that one directory.
+
+### File map (all under `/Users/georgf/src/entireio/forgemark/cmd/forgemark/`)
+
+- `main.go` — entry point, `runConfig` struct, **all flag definitions** (`parseFlags`), repo-list expansion (`expandRepos`), the concurrency-sweep driver (`run`/`runLevel`), and results writing. **This is where the destination ref/branch name is generated.**
+- `agent.go` — the `agent` type (one synthetic writer with an in-memory repo). Holds the per-agent `ref`, does the commit loop and the `branch`/`repo`-strategy push (`push`). Also error classification/normalization (note the `reRef` regex `refs/heads/\S+`).
+- `session.go` — the `session` strategy loop (`runSessions`, `cloneSession`, `pushRef`, `deleteRef`, `normalizeBaseRef`). Derives session-scoped refs from the agent ref.
+- `endpoint.go` — resolves push destinations (`endpoint` struct, `verbatimURLFor`, generic + Entire endpoint constructors). Handles repo-path→URL joining.
+- `creds.go` — credential providers (static basic-auth + Entire jurisdiction-token exchange).
+- `stats.go` — outcome/opKind enums, sample aggregation, percentile computation, `levelResult`.
+- `*_test.go` — tests for creds, endpoint, main, stats.
+- Top-level: `README.md`, `go.mod`/`go.sum`, `mise.toml`, `.golangci.yml`, `.github/workflows/ci.yml`, `LICENSE`, plus prebuilt binaries (`forgemark`, `forgemark-amd64`, `forgemark-linux-amd64`).
+
+Git history confirms the rename you mentioned: commit `433166e` "Append repo paths verbatim; rename -repo-prefix to -repo-pattern (#1)". There are **no remaining references to `repo-prefix`** anywhere in the Go source (only `repo-pattern` exists now).
+
+---
+
+## 1. Entry point and flag definitions
+
+Entry point: `main.go:48` `func main()` → calls `run()` (`main.go:83`) → `parseFlags()` (`main.go:307`).
+
+All flags are defined with the stdlib `flag` package inside `parseFlags()`. Exact code, `main.go:312-336`:
+
+```go
+flag.StringVar(&amp;cfg.remote, "remote", "", "base URL of the forge, e.g. https://gitlab.com (repos are appended verbatim as &lt;base&gt;/&lt;repo&gt;); for Entire, the cluster base URL")
+flag.StringVar(&amp;cfg.tokenFile, "token-file", "", "path to a file holding the credential secret (Entire: the subject token); \"-\" reads stdin. Preferred over $ACCESS_TOKEN — keeps the secret off argv")
+flag.StringVar(&amp;cfg.user, "user", "", "basic-auth username for the credential (default x-access-token; token forges ignore it)")
+flag.StringVar(&amp;reposCSV, "repos", "", "comma-separated repo paths, appended to -remote verbatim (e.g. you/bench.git)")
+flag.StringVar(&amp;pattern, "repo-pattern", "", "repo path template; {n} is replaced by the index (1..N), used with -repo-count (e.g. you/bench-{n})")
+flag.IntVar(&amp;repoCount, "repo-count", 0, "number of repos for -repo-pattern (expands {n} = 1..N)")
+flag.StringVar(&amp;cfg.strategy, "strategy", "branch", "branch (one repo, per-agent branches) | repo (spread across repos) | session (clone+push loop per agent)")
+flag.StringVar(&amp;concCSV, "concurrency", "1,8,32,128", "comma-separated writer counts to sweep")
+flag.DurationVar(&amp;cfg.duration, "duration", 60*time.Second, "measured window per concurrency level")
+flag.DurationVar(&amp;cfg.warmup, "warmup", 10*time.Second, "warm-up before measuring (excluded from stats)")
+flag.IntVar(&amp;cfg.commit.filesMin, "files-min", 1, "min changed files per commit")
+flag.IntVar(&amp;cfg.commit.filesMax, "files-max", 10, "max changed files per commit")
+flag.IntVar(&amp;cfg.commit.fileSize, "file-size", 2048, "bytes per changed file")
+flag.StringVar(&amp;cfg.objectFmt, "object-format", "auto", "auto | sha1 | sha256 (auto probes the entiredb advertisement; generic/github default sha1)")
+flag.BoolVar(&amp;cfg.insecure, "insecure", false, "skip TLS verification (dev/self-signed hosts)")
+flag.StringVar(&amp;cfg.out, "out", "", "write JSON results here (default: results/forgemark-&lt;id&gt;.json)")
+flag.IntVar(&amp;cfg.sessionCommits, "session-commits", 5, "session strategy: commit+push checkpoints per cloned session")
+flag.IntVar(&amp;cfg.cloneDepth, "clone-depth", 1, "session strategy: shallow clone depth (1=tip; 0=full history)")
+flag.StringVar(&amp;cfg.baseRef, "base-ref", "", "session strategy: branch to clone — bare name (main) or full ref (refs/heads/main); default: remote default branch")
+
+// entiredb: presence of -token-url/-jurisdiction selects the entiredb path.
+flag.StringVar(&amp;cfg.tokenURL, "token-url", "", "entiredb: core /oauth/token endpoint, ...")
+flag.StringVar(&amp;cfg.jurisdiction, "jurisdiction", "", "entiredb: jurisdiction audience host (bare origin), ...")
+flag.StringVar(&amp;cfg.clientID, "client-id", "entire-cli", "entiredb: public OAuth client id for the exchange")
+flag.Parse()
+```
+
+Notably, `reposCSV`, `pattern`, `concCSV`, and `repoCount` are **local variables** in `parseFlags` (declared at `main.go:309-310`), not fields on `runConfig`. The rest bind directly into the `cfg` struct.
+
+The `runConfig` struct is defined at `main.go:55-81` (fields: `remote`, `tokenFile`, `user`, `repos []string`, `strategy`, `concurrency []int`, `duration`, `warmup`, `commit`, `objectFmt`, `insecure`, `out`, `runID`, then session fields `sessionCommits`/`cloneDepth`/`baseRef`, then Entire fields `tokenURL`/`jurisdiction`/`clientID`). There is currently **no branch-prefix field** here — a `-branch-prefix` flag would need a new field added to this struct.
+
+Post-parse validation runs at `main.go:338-372`, ending with the `runID` assignment (see below).
+
+---
+
+## 2. How git branch names are generated (the core answer for your change)
+
+There are two layers.
+
+**(a) The run ID** — `main.go:371`:
+
+```go
+cfg.runID = "fm" + strconv.FormatInt(time.Now().Unix(), 36)
+```
+
+So `runID` is the literal string `fm` followed by a base-36 Unix timestamp, e.g. `fmlk3n8a`. This `fm` is currently the only "prefix" on branch names, and it's hardcoded.
+
+**(b) The destination ref** — generated once per agent in `runLevel`, `main.go:256`:
+
+```go
+ref := fmt.Sprintf("refs/heads/%s-c%d-a%d", cfg.runID, c, i)
+```
+
+where `c` is the concurrency level and `i` is the agent index (0-based). It's passed into `newAgent(i, repoPath, node, ref, ...)` at `main.go:257` and stored on the agent as `a.ref` (`agent.go:38`, commented `// destination ref, e.g. refs/heads/&lt;run&gt;-a7`).
+
+So the **current branch-name format** is:
+
+```
+refs/heads/fm&lt;base36-unix-ts&gt;-c&lt;concurrency&gt;-a&lt;agentIndex&gt;
+```
+
+e.g. `refs/heads/fmlk3n8a-c32-a5`.
+
+**How the ref is used per strategy:**
+
+- `branch` and `repo` strategies — `agent.push`, `agent.go:190-198`:
+  ```go
+  RefSpecs: []config.RefSpec{config.RefSpec("+refs/heads/master:" + a.ref)},
+  Force: true,
+  ```
+  Force-pushes the local `master` to the agent's ref.
+
+- `session` strategy — `runSessions`, `session.go:52`:
+  ```go
+  sessRef := fmt.Sprintf("%s-s%d", a.ref, session)
+  ```
+  Appends `-s&lt;sessionNumber&gt;` to the base ref, so session refs look like `refs/heads/fmlk3n8a-c32-a5-s3`. That `sessRef` is pushed (`pushRef`, `session.go:130-148`) and later deleted (`deleteRef`, `session.go:156-175`).
+
+There is **no other branch-naming logic** and no existing user-facing prefix control — the only prefix is the hardcoded `fm` in `runID`. For a `-branch-prefix` flag, the single generation site to change is `main.go:256` (and you'd feed the new prefix through `runConfig` + `parseFlags`); everything downstream (`agent.push`, `runSessions`/`pushRef`/`deleteRef`) just consumes `a.ref` and needs no change.
+
+One thing to watch: `agent.go:236` defines `reRef = regexp.MustCompile(`refs/heads/\S+`)`, used by `normalizeErr` (`agent.go:242-252`) to collapse volatile refs in error messages for grouping. A custom branch prefix still lives under `refs/heads/`, so this regex keeps working regardless of prefix.
+
+---
+
+## 3. Existing "prefix" handling and `-repo-pattern` usage
+
+The old `-repo-prefix` is fully gone; it's now `-repo-pattern`. Note this is about **repo paths**, not branch names — a separate concern from the `-branch-prefix` you want to add.
+
+- Flag defs: `main.go:316-317` (`-repo-pattern` and `-repo-count`), both bound to the local vars `pattern` and `repoCount`.
+- Expansion logic: `expandRepos(reposCSV, pattern, repoCount)` at `main.go:379-405`, called from `main.go:338`. Key behavior:
+  - `-repos` and `-repo-pattern` are mutually exclusive (`main.go:383`).
+  - `-repo-pattern` requires `-repo-count &gt; 0` (`main.go:391`) and must contain the `{n}` placeholder (`main.go:394`).
+  - Expansion, `main.go:396-398`:
+    ```go
+    for i := 1; i &lt;= count; i++ {
+        repos = append(repos, strings.ReplaceAll(pattern, "{n}", strconv.Itoa(i)))
+    }
+    ```
+- The resulting `cfg.repos` are used **verbatim** as URL path suffixes via `verbatimURLFor(node, repo)` (`endpoint.go:31-33`), which just trims slashes and joins with one `/`. No rewriting anywhere.
+- Doc comments referencing the pattern: `main.go:375-378`, `endpoint.go:28` and `endpoint.go:53`.
+
+So `-repo-pattern` is a good structural template to mirror for style, but the repo-pattern flow has nothing to do with branch names — the branch analog is entirely at `main.go:256`/`runID` at `main.go:371`.
+
+---
+
+## 4. Where push/benchmark logic lives (recap)
+
+- Sweep orchestration: `run` (`main.go:83-118`) loops over `cfg.concurrency`, calling `runLevel` per level.
+- Per-level agent setup + branch-ref generation: `runLevel` (`main.go:244-288`) — spins up `c` agents, computes each `ref` (line 256), runs them concurrently for `warmup+duration`, folds samples via `summarize`.
+- Per-agent push loop (`branch`/`repo`): `agent.run` → `agent.commit` → `agent.push` (`agent.go:107-203`).
+- Session loop: `agent.runSessions` and helpers in `session.go`.
+- Endpoint/URL resolution: `endpoint.go`.
+
+---
+
+## 5. README documentation of flags/options
+
+`/Users/georgf/src/entireio/forgemark/README.md`:
+
+- **Strategies table** — lines 34-38 (describes `branch`/`repo`/`session`; note "each pushes its own branch").
+- **Usage examples** — lines 68-96, including the `-repo-pattern "org/bench-{n}" -repo-count 16` example at line 83.
+- **"Key flags" table** — lines 138-153. The relevant row for repos, line 145:
+  ```
+  | `-repos` / `-repo-pattern`+`-repo-count` | — | target repo path(s), appended verbatim; `-repo-pattern` expands `{n}` to `1..N` |
+  ```
+- **Entire flags table** — lines 155-164.
+- **Environment variables** — lines 166-170 (`ACCESS_TOKEN`).
+- **"How it works"** — lines 172-178 ("pushes its own branch in a tight loop").
+- **Caveats about branches left on the target** — lines 186-191: `branch`/`repo` leave one per-agent branch each (no cleanup); `session` deletes its ephemeral branches.
+
+The README currently has **no mention of branch naming or any branch-prefix** — a new `-branch-prefix` flag would want a new row in the Key-flags table (lines 138-153) and possibly a note in the Caveats section (lines 186-191) since it affects the branch names left behind.
+
+---
+
+## Summary for planning a `-branch-prefix` option
+
+The change is small and localized:
+1. Add a field (e.g. `branchPrefix string`) to `runConfig` (`main.go:55-81`).
+2. Add `flag.StringVar(&amp;cfg.branchPrefix, "branch-prefix", ...)` in `parseFlags` (near `main.go:312-335`), plus any validation after `flag.Parse()`.
+3. Incorporate it into the ref at the single generation site `main.go:256` (currently `refs/heads/%s-c%d-a%d` with `cfg.runID`). Decide whether the prefix replaces or precedes the `fm...` runID (the runID also drives the results filename at `main.go:422` and `run_id` JSON field at `main.go:425`, so keep those concerns separate).
+4. Downstream needs no changes: `agent.push` (`agent.go:192`), `runSessions`/`pushRef`/`deleteRef` (`session.go`) all consume `a.ref` unchanged, and the `reRef` regex (`agent.go:236`) still matches anything under `refs/heads/`.
+5. Document it in `README.md` (Key flags table ~line 145-153, and Caveats ~line 186).
+
+Note: I did not create a plan file — per my read-only search role I'm returning findings directly here for you (the parent agent) to use.</result>
+<usage><subagent_tokens>51023</subagent_tokens><tool_uses>10</tool_uses><duration_ms>100129</duration_ms></usage>
+</task-notification>
+
+---
+
+/grill-me
+
+---
+
+Validate the prefix
+
+---
+
+This is getting complicated. We should assume the user knows what they're doing.
+
+---
+
+yes
+
+---
+
+/commit-commands:commit-push-pr
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>a3fb1a95a2de14250</task-id>
+<tool-use-id>toolu_01U75z5AXGwPAcQUcf2sPcYY</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-georgf-src-entireio-forgemark/072cb62a-52e2-4aa1-98b5-cb46644915e1/tasks/a3fb1a95a2de14250.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I've confirmed all three points by reading the actual code.
+
+## Findings
+
+**No efficiency regressions introduced by this diff. Everything is efficient.**
+
+Details confirming each focus area:
+
+- **`destRef` in the runLevel loop** — `main.go:258` — Called once per agent inside the agent-construction loop (`for i := range c`, lines 252-264), which runs `c` times at level setup, not per push. This is identical call frequency to the previous inline `fmt.Sprintf` it replaced. The new version does one `fmt.Sprintf` with two `%s` verbs instead of one — a negligible difference (single allocation either way, same call site). No per-iteration waste added.
+
+- **The `ref` value is stored, not recomputed** — `main.go:259` → `agent.go:73` — `ref` is passed to `newAgent` and stored as `a.ref`. The push hot path (`agent.go:185-198`) reads `a.ref` directly; `destRef` is never called from `agent.run`/`agent.push`. Confirmed the ref is computed exactly once per agent, never per push.
+
+- **The `Validate()` call** — `main.go:379` — Lives in `parseFlags`, which runs once at startup (before any level or push loop). Not on any hot path.
+
+One pre-existing note (NOT introduced by this diff, so not a finding against it): the push path at `agent.go:192` does a per-push string concat `"+refs/heads/master:" + a.ref` inside `config.RefSpec(...)`. Since `a.ref` is fixed for an agent's lifetime, this RefSpec could be built once in `newAgent` and reused. But the diff under review neither introduced nor touched this, so it's out of scope for a "waste introduced by the diff" review.
+
+Verdict: the diff is clean from an efficiency standpoint.</result>
+<usage><subagent_tokens>24424</subagent_tokens><tool_uses>6</tool_uses><duration_ms>40103</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>af873106fcb2d47bc</task-id>
+<tool-use-id>toolu_01SdHVC8pe1zjra1whzuhayi</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-georgf-src-entireio-forgemark/072cb62a-52e2-4aa1-98b5-cb46644915e1/tasks/af873106fcb2d47bc.output</output-file>
+<status>completed</status>
+<summary>Agent "Reuse review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have enough context. Here are my findings on the reuse angle.
+
+## Findings
+
+**1. `destRef` (main.go:388) — ref construction is clean, no duplication.**
+- session.go:52 builds session refs as `fmt.Sprintf("%s-s%d", a.ref, session)` where `a.ref` is exactly the `destRef(...)` output threaded through `newAgent` (agent.go:38). So session refs already *compose on top of* `destRef`'s result rather than re-deriving `refs/heads/...`. No change needed in either direction — `destRef` builds the base ref, `sessRef` extends it.
+- `normalizeBaseRef` (session.go:180) is the other ref helper in the package, but it solves a different problem (bare name → qualified `refs/heads/` via `plumbing.NewBranchReferenceName`). `destRef` also needs the `-c%d-a%d` suffix, so it can't meaningfully call `NewBranchReferenceName` — the `refs/heads/` literal in the `Sprintf` is not a reusable-helper miss. Clean.
+
+**2. Validation via `plumbing.ReferenceName(...).Validate()` (main.go:379) — no existing helper to mirror; consistent with parseFlags style.**
+- parseFlags does all its checks as inline `if ... { return nil, fmt.Errorf(...) }` (e.g. main.go:346-373) plus `parseObjectFormat` returning an error (~main.go:240). The new `.Validate()` call follows that same fail-fast-at-parse pattern and duplicates nothing. Note in passing: `normalizeBaseRef` does *not* validate `-base-ref`, so there's no existing validation helper this could have reused — the new code isn't re-implementing anything.
+
+**3. main_test.go:49 `TestDestRef` — does NOT follow the established `TestExpandRepos` table-test convention. This is the one real reuse-of-pattern gap.**
+- `TestExpandRepos` (main_test.go:10) uses a single table of structs with a `name` field and a `wantErr bool`, driven through `t.Run(tt.name, func(t *testing.T){...})` subtests (main_test.go:33-46).
+- `TestDestRef` instead uses **two separate anonymous struct slices** (`assembly`, `validation`) with **no `name` fields** and **no `t.Run` subtests** — bare `for` loops calling `t.Errorf`. Concrete cost: on failure you get no named subtest, can't run one case in isolation (`-run TestDestRef/bench_slash`), and the two-table split diverges from the codebase's one-table-with-`wantErr` idiom that already expresses exactly this "valid vs error" shape (see the `wantErr` cases at main_test.go:26-31). Reuse the `TestExpandRepos` structure: one table with `name` + `want`/`wantErr` fields, wrapped in `t.Run(tt.name, ...)`.
+
+Bottom line: the production code (`destRef` + validation) is clean on the reuse angle — nothing in the package it should be calling instead. The only cleanup is that the new test ignores the existing `TestExpandRepos` table+`t.Run` convention living in the same file.</result>
+<usage><subagent_tokens>30549</subagent_tokens><tool_uses>8</tool_uses><duration_ms>70250</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a46af90e9f9c1ee58</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-georgf-src-entireio-forgemark/072cb62a-52e2-4aa1-98b5-cb46644915e1/tasks/a46af90e9f9c1ee58.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Read complete. I have the full grounding. Here are my findings.
+
+## Findings
+
+**1. cmd/forgemark/main.go:62, :321, :385-387 — the same explanation is written three times — keep it in one place.**
+The phrase "prepended verbatim … before the run ID" appears in the struct field comment (`// prepended verbatim to generated branch names, before the run ID`), in the flag help string (line 321), and again in the `destRef` doc comment (lines 385-387). Three copies of one idea. Simpler form: drop the struct field comment at line 62 entirely — the field name `branchPrefix` plus the flag help and the `destRef` doc already cover it. (The other fields like `strategy`, `repos` carry no comment, so an uncommented `branchPrefix` matches local convention.)
+
+**2. cmd/forgemark/main.go:375-378 — the 4-line validation comment over-explains relative to the file's one-line comment style.**
+Every other inline rationale in `parseFlags` is a single terse clause (e.g. lines 366, 372, 335). This block gives four separate justifications. The last one ("fails fast at parse time rather than as per-push errors mid-measurement") is self-evident from the code living in `parseFlags` and returning an error. Simpler form: one line, e.g.
+`// Validate the fully assembled ref — a trailing "/" or bare word is valid mid-ref but not standalone.`
+
+**3. cmd/forgemark/main.go:385-387 — `destRef` doc comment restates what the format string plainly shows.**
+"so branches group under it while staying unique per run and per (concurrency, agent)" narrates the `-c%d-a%d` suffix that is right there. First sentence ("builds an agent's destination branch ref; branchPrefix is prepended verbatim before the run ID") is sufficient.
+
+**4. cmd/forgemark/main.go:379 — `destRef(cfg.branchPrefix, cfg.runID, 1, 0)` — the `1, 0` placeholders read as magic numbers.**
+Validity is independent of the `c`/`a` integers (they always render as digits), so any values work, but that intent isn't visible at the call site — a reader wonders whether `1, 0` matter. This is inherent to reusing `destRef` for validation and hard to improve without changing the signature, so it's a minor note, not a defect. The representative-check comment partially covers it; if you trim that comment (finding 2), keep the "any c/a works" nuance implied.
+
+**5. cmd/forgemark/main_test.go:66-79 — the validation table's four `valid:true` rows duplicate the assembly table's four prefixes.**
+`""`, `"bench/"`, `"bench-"`, `"bench"` are already constructed and asserted in the assembly table (lines 55-60); repeating them as "valid" in the validation table adds little — the validation table's real signal is the three invalid shapes (`"my bench/"`, `"bench~1"`, `"/bench"`). Simpler form: keep the invalid rows plus a single valid sentinel, or fold a `valid bool` into the assembly table so each prefix is declared once. That said, keeping two separate tables (exact-string assembly vs. git validity) is a defensible readability choice — this is a mild dedup opportunity, not a must-fix. The `destRef(prefix, "fm0", 1, 0)` rebuild inside the loop mirrors the production call site and is fine.
+
+## Not an issue
+- Replacing the inline `fmt.Sprintf("refs/heads/%s-c%d-a%d", …)` with `destRef` is a good de-duplication (single source for the ref format shared by production and validation). No redundant or derivable state was introduced — `branchPrefix` is genuine new input, not derivable.
+
+Net: functionally clean; the only real cleanup is documentation redundancy/verbosity (findings 1-3), with 4 and 5 as minor notes.</result>
+<usage><subagent_tokens>27952</subagent_tokens><tool_uses>4</tool_uses><duration_ms>68006</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>af893dc0ad9b5df16</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-georgf-src-entireio-forgemark/072cb62a-52e2-4aa1-98b5-cb46644915e1/tasks/af893dc0ad9b5df16.output</output-file>
+<status>completed</status>
+<summary>Agent "Altitude review" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>I have everything I need. Here is my altitude review.
+
+## Verdict: the feature is implemented at the right depth. No bandaid patterns found.
+
+The design uses a single seam — `destRef` produces the base ref, everything else composes on top — so the prefix propagates without any special-casing. Details per focus area:
+
+**1. Session/delete paths — prefix reaches them automatically, no special case. Altitude is right.**
+- `main.go:258` — `ref := destRef(cfg.branchPrefix, cfg.runID, c, i)` is the sole base-ref site; it flows into `newAgent(..., ref, ...)` and is stored as `a.ref` (`agent.go:73`).
+- `session.go:52` — `sessRef := fmt.Sprintf("%s-s%d", a.ref, session)` composes on `a.ref`, so a `bench/` prefix yields `refs/heads/bench/fmX-c1-a0-s0` with zero prefix-aware code. `pushRef` (`session.go:60`) and `deleteRef` (`session.go:77`) both consume `sessRef`, so push and cleanup stay symmetric — the delete refspec targets the same prefixed ref it created. This is genuinely automatic, not a parallel construction that could drift. Branch/repo mode pushes to `a.ref` directly (`agent.go:192`), the session suffix is the only delta. Confirmed consistent.
+
+**2. Validation via `destRef(prefix, runID, 1, 0).Validate()` — right altitude, arguably deeper than validating the prefix alone.**
+- `main.go:375-380` — Validating the *assembled* ref defers to go-git's own ref grammar (`plumbing.ReferenceName.Validate()`) on the actual artifact that gets pushed, rather than hand-rolling a bespoke prefix-validity rule. A standalone prefix check would be the bandaid (it would approximate git's grammar and mis-handle context-dependent cases like a trailing `/` or a bare word — exactly what the code comment calls out). Deferring to the real grammar on the real string is the deeper choice, and fail-fast at parse time is correct (avoids per-push errors polluting the measured window).
+- The `1, 0` placeholders couple to `destRef` only by *calling* `destRef` — the format string stays DRY, so if the ref shape changes the validation follows. The single residual smell is the implicit "these ints are representative" assumption; it's justified because all non-prefix components are fixed character classes, and `TestDestRef` (`main_test.go`) documents it. Nit-level, not brittle. One thing not covered by the representative check: the session `-s%d` suffix (`session.go:52`) — but it's the same char class as the already-validated `-c%d-a%d` suffix and cannot invalidate an otherwise-valid ref, so the gap is sound. Leave as-is.
+
+**3. `destRef` home — correct and consistent.**
+- `main.go:~387` — It's a pure package-level helper sitting next to `expandRepos`, its sibling in altitude (both assemble/validate strings from flag-derived inputs). A `func (cfg *runConfig) destRef(c, i int)` method is a plausible alternative that would bind `branchPrefix`+`runID` and shrink the arg list, but it's a wash: the free function is trivially unit-testable with literals (as `TestDestRef` shows) and stays pure. Making it an agent concern would be wrong — the ref is decided at scheduling time before the agent exists, and the agent should stay a consumer of a fully-formed ref. Keep it where it is.
+
+**4. `reRef` error-normalization — not broken by the new feature. Confirmed fine.**
+- `agent.go:236` — `refs/heads/\S+`; `\S+` includes `/`, so a prefixed ref like `refs/heads/bench/fmX-c1-a0-s0` is matched in full and collapsed to `&lt;ref&gt;`. The prefix (even with slashes) just adds more non-space characters that the existing pattern already consumes. The shared grouping mechanism keeps working with no prefix-aware change needed. No regression.
+
+Net: the change generalizes cleanly through one mechanism (`destRef` → `a.ref` → session composition) and reuses go-git's grammar for validation and the existing `\S+` regex for normalization, rather than layering prefix-specific special cases onto any of them. Nothing to fix.</result>
+<usage><subagent_tokens>30076</subagent_tokens><tool_uses>10</tool_uses><duration_ms>102557</duration_ms></usage>
+</task-notification>

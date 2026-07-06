@@ -1,0 +1,186 @@
+{
+  "cli_version": "0.7.9-nightly.202607050712.4398a44c1",
+  "checkpoint_id": "a4ef23147e66",
+  "session_id": "072cb62a-52e2-4aa1-98b5-cb46644915e1",
+  "strategy": "manual-commit",
+  "created_at": "2026-07-06T11:43:19.53923Z",
+  "branch": "add-branch-prefix-flag",
+  "checkpoints_count": 10,
+  "save_step_count": 6,
+  "files_touched": [
+    "README.md",
+    "cmd/forgemark/main.go",
+    "cmd/forgemark/main_test.go"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-8[1m]",
+  "turn_id": "6530a625408d",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 21460,
+    "cache_creation_tokens": 261093,
+    "cache_read_tokens": 4818654,
+    "output_tokens": 51281,
+    "api_call_count": 59
+  },
+  "skill_events_version": 1,
+  "skill_events": [
+    {
+      "id": "prompt-skill-claude-code-grill-me-2026-07-06T06:06:10.388656Z",
+      "event_type": "prompt_invocation",
+      "skill": {
+        "name": "grill-me"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "prompt_slash_command",
+        "confidence": "explicit"
+      },
+      "turn_id": "1d8d58b089e2",
+      "timestamp": "2026-07-06T06:06:10.388656Z",
+      "native": {
+        "command": "/grill-me"
+      },
+      "collapse": {
+        "target": "user_message",
+        "label": "/grill-me",
+        "default_collapsed": true
+      }
+    },
+    {
+      "id": "prompt-skill-claude-code-commit-commands:commit-push-pr-2026-07-06T11:33:33.787935Z",
+      "event_type": "prompt_invocation",
+      "skill": {
+        "name": "commit-commands:commit-push-pr"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "prompt_slash_command",
+        "confidence": "explicit"
+      },
+      "turn_id": "4266dbc68cd4",
+      "timestamp": "2026-07-06T11:33:33.787935Z",
+      "native": {
+        "command": "/commit-commands:commit-push-pr"
+      },
+      "collapse": {
+        "target": "user_message",
+        "label": "/commit-commands:commit-push-pr",
+        "default_collapsed": true
+      }
+    },
+    {
+      "id": "prompt-skill-claude-code-simplify-2026-07-06T11:33:49.325045Z",
+      "event_type": "prompt_invocation",
+      "skill": {
+        "name": "simplify"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "prompt_slash_command",
+        "confidence": "explicit"
+      },
+      "turn_id": "e919f7b8f09a",
+      "timestamp": "2026-07-06T11:33:49.325045Z",
+      "native": {
+        "command": "/simplify"
+      },
+      "collapse": {
+        "target": "user_message",
+        "label": "/simplify",
+        "default_collapsed": true
+      }
+    },
+    {
+      "id": "prompt-skill-claude-code-commit-commands:commit-push-pr-2026-07-06T11:42:54.690896Z",
+      "event_type": "prompt_invocation",
+      "skill": {
+        "name": "commit-commands:commit-push-pr"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "prompt_slash_command",
+        "confidence": "explicit"
+      },
+      "turn_id": "6530a625408d",
+      "timestamp": "2026-07-06T11:42:54.690896Z",
+      "native": {
+        "command": "/commit-commands:commit-push-pr"
+      },
+      "collapse": {
+        "target": "user_message",
+        "label": "/commit-commands:commit-push-pr",
+        "default_collapsed": true
+      }
+    }
+  ],
+  "session_metrics": {
+    "turn_count": 10
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-07-06T11:43:19.505522Z",
+    "agent_lines": 66,
+    "agent_removed": 15,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 66,
+    "total_lines_changed": 81,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 1,
+      "user_lines_removed": 0,
+      "agent_lines_added": 76,
+      "agent_lines_removed": 15,
+      "user_added_per_file": {
+        "entire-subject-token": 1
+      }
+    },
+    {
+      "checkpoint_number": 3,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 76,
+      "agent_lines_removed": 15
+    },
+    {
+      "checkpoint_number": 4,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 76,
+      "agent_lines_removed": 15
+    },
+    {
+      "checkpoint_number": 5,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 76,
+      "agent_lines_removed": 15
+    },
+    {
+      "checkpoint_number": 6,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 76,
+      "agent_lines_removed": 15
+    },
+    {
+      "checkpoint_number": 7,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 66,
+      "agent_lines_removed": 15
+    }
+  ]
+}
