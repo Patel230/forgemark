@@ -1,7 +1,11 @@
 package main
 
 import (
+	"flag"
+	"io"
+	"os"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/go-git/go-git/v6/plumbing"
@@ -44,6 +48,59 @@ func TestExpandRepos(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestParseFlagsCloneStrategyIgnoresCommitShape(t *testing.T) {
+	cfg, err := parseFlagsForTest(t,
+		"-strategy", "clone",
+		"-repos", "org/repo",
+		"-clone-depth", "3",
+		"-base-ref", "main",
+		"-files-min", "10",
+		"-files-max", "1",
+		"-file-size", "0",
+	)
+	if err != nil {
+		t.Fatalf("parseFlags clone = %v, want commit-shape flags ignored", err)
+	}
+	if cfg.strategy != "clone" {
+		t.Fatalf("strategy = %q, want clone", cfg.strategy)
+	}
+	if cfg.cloneDepth != 3 || cfg.baseRef != "main" {
+		t.Fatalf("clone knobs = depth %d base %q, want 3/main", cfg.cloneDepth, cfg.baseRef)
+	}
+	if !reflect.DeepEqual(cfg.repos, []string{"org/repo"}) {
+		t.Fatalf("repos = %v, want [org/repo]", cfg.repos)
+	}
+}
+
+func TestParseFlagsCloneStrategyNeedsRepos(t *testing.T) {
+	_, err := parseFlagsForTest(t, "-strategy", "clone")
+	if err == nil || !strings.Contains(err.Error(), "no repos") {
+		t.Fatalf("parseFlags clone without repos err = %v, want no repos error", err)
+	}
+}
+
+func TestParseFlagsCommitShapeStillValidatedForPushStrategies(t *testing.T) {
+	_, err := parseFlagsForTest(t, "-strategy", "branch", "-repos", "org/repo", "-files-min", "0")
+	if err == nil || !strings.Contains(err.Error(), "-files-min") {
+		t.Fatalf("parseFlags branch with -files-min 0 err = %v, want -files-min validation", err)
+	}
+}
+
+func parseFlagsForTest(t *testing.T, args ...string) (*runConfig, error) {
+	t.Helper()
+	oldArgs := os.Args
+	oldCommandLine := flag.CommandLine
+	fs := flag.NewFlagSet("forgemark", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	flag.CommandLine = fs
+	os.Args = append([]string{"forgemark"}, args...)
+	t.Cleanup(func() {
+		os.Args = oldArgs
+		flag.CommandLine = oldCommandLine
+	})
+	return parseFlags()
 }
 
 func TestDestRef(t *testing.T) {

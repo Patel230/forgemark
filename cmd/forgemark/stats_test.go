@@ -218,3 +218,32 @@ func TestSummarizeSplitsCloneAndPush(t *testing.T) {
 		t.Fatalf("clone p50=%v, want 200", r.CloneP50ms)
 	}
 }
+
+func TestSummarizeCloneStrategyUsesCloneSamplesAsPrimaryOp(t *testing.T) {
+	warmup := 10 * time.Second
+	window := 10 * time.Second
+	samples := []sample{
+		{offset: 5 * time.Second, dur: 1 * time.Second, res: outcomeOK, op: opClone}, // warm-up: dropped
+		{offset: 11 * time.Second, dur: 100 * time.Millisecond, res: outcomeOK, op: opClone},
+		{offset: 12 * time.Second, dur: 300 * time.Millisecond, res: outcomeOK, op: opClone},
+		{offset: 13 * time.Second, res: outcomeErr, op: opClone, msg: "clone: auth failed"},
+	}
+	r := summarize(samples, 4, "clone", 1, 2, warmup, window, "ignored")
+
+	if r.Pushes != 3 || r.OK != 2 || r.OtherErrors != 1 {
+		t.Fatalf("primary clone counts: Pushes=%d OK=%d OtherErrors=%d, want 3/2/1", r.Pushes, r.OK, r.OtherErrors)
+	}
+	if want := float64(2) / window.Seconds(); r.OpsPerSec != want {
+		t.Fatalf("OpsPerSec = %v, want clone throughput %v", r.OpsPerSec, want)
+	}
+	if r.P50ms != 100 || r.P95ms != 300 || r.P99ms != 300 || r.Maxms != 300 {
+		t.Fatalf("primary clone latencies p50/p95/p99/max = %v/%v/%v/%v, want 100/300/300/300", r.P50ms, r.P95ms, r.P99ms, r.Maxms)
+	}
+	if r.Clones != 3 || r.CloneOK != 2 || r.CloneErrors != 1 || r.CloneP50ms != 100 {
+		t.Fatalf("clone side counts/latency = clones %d ok %d err %d p50 %v, want 3/2/1/100",
+			r.Clones, r.CloneOK, r.CloneErrors, r.CloneP50ms)
+	}
+	if len(r.ErrorMessages) != 1 || r.ErrorMessages[0].Message != "clone: auth failed" {
+		t.Fatalf("primary ErrorMessages = %+v, want clone error", r.ErrorMessages)
+	}
+}

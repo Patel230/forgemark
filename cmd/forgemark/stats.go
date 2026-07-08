@@ -21,7 +21,7 @@ type opKind int
 
 const (
 	opPush  opKind = iota // a receive-pack push (the write path)
-	opClone               // a clone (the read path; session strategy)
+	opClone               // a clone (the read path; clone/session strategy)
 )
 
 // sample is one recorded operation. offset is measured from the start of the
@@ -51,8 +51,8 @@ type levelResult struct {
 	Repos       int     `json:"repos"`
 	Nodes       int     `json:"nodes"`
 	WindowSec   float64 `json:"window_sec"`
-	Pushes      int     `json:"pushes"` // attempts in the measured window
-	OK          int     `json:"ok"`     // successful pushes
+	Pushes      int     `json:"pushes"` // attempts in the measured window; clone strategy uses this as its primary op count
+	OK          int     `json:"ok"`     // successful primary operations
 	CASFailures int     `json:"cas_failures"`
 	OtherErrors int     `json:"other_errors"`
 	OpsPerSec   float64 `json:"ops_per_sec"` // OK / window
@@ -63,7 +63,7 @@ type levelResult struct {
 	Maxms       float64 `json:"max_ms"`
 	CommitFiles string  `json:"commit_files"` // e.g. "1-10 x 2048B"
 
-	// Session-strategy read side (op==clone). Omitted in push/repo modes.
+	// Clone/session-strategy read side (op==clone). Omitted in push/repo modes.
 	Clones      int     `json:"clones,omitempty"`
 	CloneOK     int     `json:"clone_ok,omitempty"`
 	CloneErrors int     `json:"clone_errors,omitempty"`
@@ -170,9 +170,6 @@ func summarize(samples []sample, concurrency int, strategy string, repos, nodes 
 	r.ErrorMessages = errGroups(pushErrs)
 	r.CloneErrorMessages = errGroups(cloneErrs)
 
-	if window > 0 {
-		r.OpsPerSec = float64(r.OK) / window.Seconds()
-	}
 	if len(okDurs) > 0 {
 		sort.Float64s(okDurs)
 		r.P50ms = percentile(okDurs, 50)
@@ -186,6 +183,23 @@ func summarize(samples []sample, concurrency int, strategy string, repos, nodes 
 		r.CloneP50ms = percentile(cloneDurs, 50)
 		r.CloneP95ms = percentile(cloneDurs, 95)
 		r.CloneP99ms = percentile(cloneDurs, 99)
+	}
+	if strategy == "clone" {
+		r.Pushes = r.Clones
+		r.OK = r.CloneOK
+		r.OtherErrors = r.CloneErrors
+		r.CASFailures = 0
+		r.ErrorMessages = r.CloneErrorMessages
+		r.P50ms = r.CloneP50ms
+		r.P95ms = r.CloneP95ms
+		r.P99ms = r.CloneP99ms
+		if len(cloneDurs) > 0 {
+			r.P999ms = percentile(cloneDurs, 99.9)
+			r.Maxms = cloneDurs[len(cloneDurs)-1]
+		}
+	}
+	if window > 0 {
+		r.OpsPerSec = float64(r.OK) / window.Seconds()
 	}
 	return r
 }

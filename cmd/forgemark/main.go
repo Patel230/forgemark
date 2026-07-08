@@ -18,7 +18,8 @@
 //	    direct-to-node push, node discovery via X-Entire-Replicas.
 //
 // Strategies (-strategy): branch (default; per-agent branches on one repo),
-// repo (spread across N repos), session (clone+push loop per agent).
+// repo (spread across N repos), clone (clone-only read loop), session
+// (clone+push loop per agent).
 //
 // Only ever run this against infrastructure you own or are explicitly
 // authorized to load-test.
@@ -241,12 +242,19 @@ func parseObjectFormat(s string) (formatcfg.ObjectFormat, error) {
 	}
 }
 
-// runLevel runs a single concurrency level: spin up c agents, push for
+// runLevel runs a single concurrency level: spin up c agents for
 // warmup+duration, then fold their samples into one result.
 func runLevel(ctx context.Context, cfg *runConfig, creds credentialProvider, ep *endpoint, httpc *http.Client, c int) (levelResult, error) {
+	var clone *cloneConfig
 	var sess *sessionConfig
-	if cfg.strategy == "session" {
-		sess = &sessionConfig{commits: cfg.sessionCommits, cloneDepth: cfg.cloneDepth, baseRef: cfg.baseRef}
+	switch cfg.strategy {
+	case "clone":
+		clone = &cloneConfig{cloneDepth: cfg.cloneDepth, baseRef: cfg.baseRef}
+	case "session":
+		sess = &sessionConfig{
+			cloneConfig: cloneConfig{cloneDepth: cfg.cloneDepth, baseRef: cfg.baseRef},
+			commits:     cfg.sessionCommits,
+		}
 	}
 	agents := make([]*agent, c)
 	for i := range c {
@@ -256,7 +264,7 @@ func runLevel(ctx context.Context, cfg *runConfig, creds credentialProvider, ep 
 		}
 		node := ep.nodes[i%len(ep.nodes)]
 		ref := destRef(cfg.branchPrefix, cfg.runID, c, i)
-		a, err := newAgent(i, repoPath, node, ref, ep.objFmt, &cfg.commit, creds, httpc, sess)
+		a, err := newAgent(i, repoPath, node, ref, ep.objFmt, &cfg.commit, creds, httpc, clone, sess)
 		if err != nil {
 			return levelResult{}, fmt.Errorf("new agent %d: %w", i, err)
 		}
@@ -317,7 +325,7 @@ func parseFlags() (*runConfig, error) {
 	flag.StringVar(&reposCSV, "repos", "", "comma-separated repo paths, appended to -remote verbatim (e.g. you/bench.git)")
 	flag.StringVar(&pattern, "repo-pattern", "", "repo path template; {n} is replaced by the index (1..N), used with -repo-count (e.g. you/bench-{n})")
 	flag.IntVar(&repoCount, "repo-count", 0, "number of repos for -repo-pattern (expands {n} = 1..N)")
-	flag.StringVar(&cfg.strategy, "strategy", "branch", "branch (one repo, per-agent branches) | repo (spread across repos) | session (clone+push loop per agent)")
+	flag.StringVar(&cfg.strategy, "strategy", "branch", "branch (one repo, per-agent branches) | repo (spread across repos) | clone (clone-only read loop) | session (clone+push loop per agent)")
 	flag.StringVar(&cfg.branchPrefix, "branch-prefix", "", "prefix prepended verbatim to branch names, before the run ID (e.g. bench/ → refs/heads/bench/fm...-c1-a0); empty keeps the default")
 	flag.StringVar(&concCSV, "concurrency", "1,8,32,128", "comma-separated writer counts to sweep")
 	flag.DurationVar(&cfg.duration, "duration", 60*time.Second, "measured window per concurrency level")
@@ -329,8 +337,8 @@ func parseFlags() (*runConfig, error) {
 	flag.BoolVar(&cfg.insecure, "insecure", false, "skip TLS verification (dev/self-signed hosts)")
 	flag.StringVar(&cfg.out, "out", "", "write JSON results here (default: results/forgemark-<id>.json)")
 	flag.IntVar(&cfg.sessionCommits, "session-commits", 5, "session strategy: commit+push checkpoints per cloned session")
-	flag.IntVar(&cfg.cloneDepth, "clone-depth", 1, "session strategy: shallow clone depth (1=tip; 0=full history)")
-	flag.StringVar(&cfg.baseRef, "base-ref", "", "session strategy: branch to clone — bare name (main) or full ref (refs/heads/main); default: remote default branch")
+	flag.IntVar(&cfg.cloneDepth, "clone-depth", 1, "clone/session strategy: shallow clone depth (1=tip; 0=full history)")
+	flag.StringVar(&cfg.baseRef, "base-ref", "", "clone/session strategy: branch to clone — bare name (main) or full ref (refs/heads/main); default: remote default branch")
 
 	// entiredb: presence of -token-url/-jurisdiction selects the entiredb path.
 	flag.StringVar(&cfg.tokenURL, "token-url", "", "entiredb: core /oauth/token endpoint, e.g. https://<region>.auth.example.com/oauth/token (selects entiredb)")
@@ -343,8 +351,8 @@ func parseFlags() (*runConfig, error) {
 		return nil, err
 	}
 	cfg.repos = repos
-	if cfg.strategy != "branch" && cfg.strategy != "repo" && cfg.strategy != "session" {
-		return nil, fmt.Errorf("invalid -strategy %q (branch|repo|session)", cfg.strategy)
+	if cfg.strategy != "branch" && cfg.strategy != "repo" && cfg.strategy != "clone" && cfg.strategy != "session" {
+		return nil, fmt.Errorf("invalid -strategy %q (branch|repo|clone|session)", cfg.strategy)
 	}
 	if cfg.strategy == "repo" && len(cfg.repos) < 2 {
 		return nil, errors.New("strategy=repo needs >= 2 repos")
@@ -362,14 +370,16 @@ func parseFlags() (*runConfig, error) {
 	if len(cfg.concurrency) == 0 {
 		return nil, errors.New("no concurrency levels")
 	}
-	if cfg.commit.filesMin < 1 {
-		return nil, errors.New("-files-min must be >= 1 (a commit needs a change to push)")
-	}
-	if cfg.commit.filesMax < cfg.commit.filesMin {
-		return nil, errors.New("-files-max < -files-min")
-	}
-	if cfg.commit.fileSize < 1 {
-		return nil, errors.New("-file-size must be >= 1 (empty blobs reproduce → ErrEmptyCommit)")
+	if cfg.strategy != "clone" {
+		if cfg.commit.filesMin < 1 {
+			return nil, errors.New("-files-min must be >= 1 (a commit needs a change to push)")
+		}
+		if cfg.commit.filesMax < cfg.commit.filesMin {
+			return nil, errors.New("-files-max < -files-min")
+		}
+		if cfg.commit.fileSize < 1 {
+			return nil, errors.New("-file-size must be >= 1 (empty blobs reproduce → ErrEmptyCommit)")
+		}
 	}
 	cfg.runID = "fm" + strconv.FormatInt(time.Now().Unix(), 36)
 	// Validate the assembled ref, not the prefix alone: validity is context-dependent
@@ -420,6 +430,11 @@ func expandRepos(reposCSV, pattern string, count int) ([]string, error) {
 }
 
 func printRow(r levelResult) {
+	if r.Strategy == "clone" {
+		fmt.Printf("  c=%-4d clone_ok=%-6d clone/s=%-8.1f p50=%-7.1f p95=%-8.1f p99=%-8.1f max=%-8.1f clone_err=%d\n",
+			r.Concurrency, r.OK, r.OpsPerSec, r.P50ms, r.P95ms, r.P99ms, r.Maxms, r.OtherErrors)
+		return
+	}
 	fmt.Printf("  c=%-4d push_ok=%-6d push/s=%-8.1f p50=%-7.1f p95=%-8.1f p99=%-8.1f max=%-8.1f cas=%d err=%d\n",
 		r.Concurrency, r.OK, r.OpsPerSec, r.P50ms, r.P95ms, r.P99ms, r.Maxms, r.CASFailures, r.OtherErrors)
 	if r.Clones > 0 {

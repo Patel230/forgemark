@@ -41,6 +41,7 @@ type agent struct {
 	cfg   *commitConfig
 	creds credentialProvider
 	httpc *http.Client
+	clone *cloneConfig   // non-nil → "clone" strategy (clone-only loop)
 	sess  *sessionConfig // non-nil → "session" strategy (clone+push loop)
 
 	repo    *git.Repository
@@ -65,15 +66,14 @@ const authorEmail = "agent@forgemark.invalid"
 const resetEvery = 128
 
 // newAgent builds an agent. In branch/repo mode it initialises its in-memory
-// repo up front (object format matched to the remote). In session mode (sess
-// != nil) the repo is (re)created per session by the clone loop, so init is
-// skipped.
-func newAgent(id int, repoPath, node, ref string, objFmt formatcfg.ObjectFormat, cfg *commitConfig, creds credentialProvider, httpc *http.Client, sess *sessionConfig) (*agent, error) {
+// repo up front (object format matched to the remote). In clone/session mode
+// the repo is created per clone by the clone loop, so init is skipped.
+func newAgent(id int, repoPath, node, ref string, objFmt formatcfg.ObjectFormat, cfg *commitConfig, creds credentialProvider, httpc *http.Client, clone *cloneConfig, sess *sessionConfig) (*agent, error) {
 	a := &agent{
 		id: id, repoPath: repoPath, node: node, ref: ref, objFmt: objFmt,
-		cfg: cfg, creds: creds, httpc: httpc, sess: sess,
+		cfg: cfg, creds: creds, httpc: httpc, clone: clone, sess: sess,
 	}
-	if sess == nil {
+	if clone == nil && sess == nil {
 		if err := a.initRepo(); err != nil {
 			return nil, err
 		}
@@ -101,10 +101,14 @@ func (a *agent) initRepo() error {
 	return nil
 }
 
-// run pushes commits in a tight loop until ctx is cancelled, recording one
-// sample per attempt. start anchors sample offsets so the caller can drop the
-// warm-up window afterwards.
+// run dispatches the agent's configured strategy until ctx is cancelled.
+// start anchors sample offsets so the caller can drop the warm-up window
+// afterwards.
 func (a *agent) run(ctx context.Context, start time.Time) {
+	if a.clone != nil {
+		a.runClones(ctx, start)
+		return
+	}
 	if a.sess != nil {
 		a.runSessions(ctx, start)
 		return
