@@ -18,6 +18,13 @@ import (
 	"github.com/go-git/go-git/v6/storage/memory"
 )
 
+// cloneConfig is the shared read-side configuration for clone and session
+// strategies.
+type cloneConfig struct {
+	cloneDepth int    // shallow clone depth (1 = tip only; 0 = full history)
+	baseRef    string // branch to clone; "" = remote default branch
+}
+
 // sessionConfig drives the "session" strategy: each agent repeatedly
 // shallow-clones the base branch, commits + pushes `commits` checkpoints to a
 // fresh ephemeral branch, then abandons it and starts a new session. This
@@ -25,9 +32,23 @@ import (
 // realistic agent shape — and exercises read/write contention (bitmap/cache
 // invalidation under push churn) that the pure-push strategies can't.
 type sessionConfig struct {
-	commits    int    // commit+push checkpoints per cloned session
-	cloneDepth int    // shallow clone depth (1 = tip only; 0 = full history)
-	baseRef    string // branch to clone; "" = remote default branch
+	cloneConfig
+	commits int // commit+push checkpoints per cloned session
+}
+
+// runClones is the agent loop for the clone strategy. Each iteration performs
+// a shallow in-memory clone of the base branch, records one op==clone sample,
+// then discards the repo.
+func (a *agent) runClones(ctx context.Context, start time.Time) {
+	for ctx.Err() == nil {
+		t0 := time.Now()
+		_, _, err := a.cloneSession(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		res := readOutcome(err)
+		a.samples = append(a.samples, sample{offset: t0.Sub(start), dur: time.Since(t0), res: res, op: opClone, msg: errMsg(res, err)})
+	}
 }
 
 // runSessions is the agent loop for the session strategy. Clone latency is
@@ -83,6 +104,10 @@ func (a *agent) runSessions(ctx context.Context, start time.Time) {
 // returns the local branch to commit on. An empty remote degrades to an orphan
 // (no read load) so the mode still runs against an unseeded repo.
 func (a *agent) cloneSession(ctx context.Context) (*git.Repository, plumbing.ReferenceName, error) {
+	clone := a.cloneConfig()
+	if clone == nil {
+		return nil, "", errors.New("clone config missing")
+	}
 	auth, err := a.creds.basicAuth(ctx, a.repoPath)
 	if err != nil {
 		return nil, "", err
@@ -96,15 +121,15 @@ func (a *agent) cloneSession(ctx context.Context) (*git.Repository, plumbing.Ref
 	wt := memfs.New()
 	opts := &git.CloneOptions{
 		URL:          verbatimURLFor(a.node, a.repoPath),
-		Depth:        a.sess.cloneDepth,
+		Depth:        clone.cloneDepth,
 		SingleBranch: true,
 		ClientOptions: []gitclient.Option{
 			gitclient.WithHTTPClient(a.httpc),
 			gitclient.WithHTTPAuth(auth),
 		},
 	}
-	if a.sess.baseRef != "" {
-		opts.ReferenceName = normalizeBaseRef(a.sess.baseRef)
+	if clone.baseRef != "" {
+		opts.ReferenceName = normalizeBaseRef(clone.baseRef)
 	}
 	repo, err := git.CloneContext(ctx, storer, wt, opts)
 	if errors.Is(err, transport.ErrEmptyRemoteRepository) {
@@ -124,6 +149,16 @@ func (a *agent) cloneSession(ctx context.Context) (*git.Repository, plumbing.Ref
 		return nil, "", fmt.Errorf("resolve head: %w", err)
 	}
 	return repo, head.Name(), nil
+}
+
+func (a *agent) cloneConfig() *cloneConfig {
+	if a.clone != nil {
+		return a.clone
+	}
+	if a.sess != nil {
+		return &a.sess.cloneConfig
+	}
+	return nil
 }
 
 // pushRef force-pushes the local working branch to a session-scoped remote ref.

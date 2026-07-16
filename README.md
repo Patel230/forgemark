@@ -1,12 +1,13 @@
 # ForgeMark
 
-**A concurrent git-push throughput benchmark for any smart-HTTP git forge.**
+**A concurrent git push/clone throughput benchmark for any smart-HTTP git forge.**
 
-ForgeMark measures **sustained push throughput and per-push latency** the way an
-agent fleet hits a forge: many concurrent writers, small commits. It drives
-**real pushes** through [`go-git`](https://github.com/go-git/go-git) (packfile
-build + ref update), so it exercises the full `git-receive-pack` path — not a
-synthetic HTTP approximation.
+ForgeMark measures **sustained push or clone throughput and per-operation
+latency** the way an agent fleet hits a forge: many concurrent writers, readers,
+or mixed sessions. It drives **real git operations** through
+[`go-git`](https://github.com/go-git/go-git) (packfile build + ref update for
+pushes, upload-pack for clones), so it exercises the forge paths directly — not
+a synthetic HTTP approximation.
 
 It works against **any smart-HTTP git host** — GitLab, Gitea, Bitbucket,
 self-hosted, GitHub Enterprise Server, github.com, and
@@ -25,9 +26,10 @@ go install github.com/entireio/forgemark/cmd/forgemark@latest
 
 ## What it measures
 
-Per concurrency level it reports successful pushes/sec, p50/p95/p99/p99.9/max
-push latency, and CAS-failure / error counts. Results print as a table and are
-written to `results/forgemark-<id>.json` for charting.
+Per concurrency level it reports successful operations/sec,
+p50/p95/p99/p99.9/max latency, and CAS-failure / error counts where they apply.
+Results print as a table and are written to `results/forgemark-<id>.json` for
+charting.
 
 ### Strategies
 
@@ -35,6 +37,7 @@ written to `results/forgemark-<id>.json` for charting.
 |---|---|---|
 | `branch` (default) | N agents, **one repo**, each pushes its own branch | **Headline single-repo number.** No client-side contention (each agent owns its ref), so it isolates the server's per-repo ref-update path. |
 | `repo` | N agents spread across **M repos** (`-repo-count`), own branches | Horizontal-scale ceiling — distinct repos serialize independently, so this should scale where `branch` saturates. |
+| `clone` | N agents, **one repo**, each loops: **shallow-clone** the base branch → discard → repeat | Read-side ceiling: how many concurrent shallow clones/sec the forge sustains, without write load. |
 | `session` | N agents, each loops: **shallow-clone** the base branch → commit+push `-session-commits` checkpoints to a fresh ephemeral branch → abandon → repeat | Realistic agent lifecycle: interleaves **read load (clone) with write load (push)** on one repo. Reports clone and push latencies separately. |
 
 ## Usage
@@ -48,21 +51,22 @@ your forge and make sure your credential can push:
 
 - **`branch`** needs **one empty repo**.
 - **`repo`** needs **M empty repos**.
-- **`session`** needs a repo with a **base branch that has content** to clone.
-  An empty repo degrades to a no-read orphan, so a session run against an
-  unseeded repo isn't measuring what you think — push a base branch first.
+- **`clone`** and **`session`** need a repo with a **base branch that has
+  content** to clone. An empty repo degrades to a no-read orphan, so a read-side
+  run against an unseeded repo isn't measuring what you think — push a base
+  branch first.
 
 Per forge, roughly:
 
 ```bash
 # GitHub (needs the gh CLI): a throwaway private repo
 gh repo create you/forgemark-target --private
-# for session runs, give it content:
+# for clone/session runs, give it content:
 #   git clone … && git commit --allow-empty -m base && git push
 
 # GitLab / Gitea / self-hosted: create an empty repo in the UI or via the
-# forge's API, ensure your token/user can push, and (for session) push a base
-# branch with at least one commit.
+# forge's API, ensure your token/user can push, and (for clone/session) push a
+# base branch with at least one commit.
 ```
 
 ### 2. Run
@@ -81,6 +85,10 @@ forgemark $FORGE -token-file ~/.forge-token \
 # Spread across 16 repos (horizontal scale)
 forgemark $FORGE -token-file ~/.forge-token -strategy repo \
   -repo-pattern "org/bench-{n}" -repo-count 16 -concurrency 32,128 -duration 2m
+
+# Clone: read-side throughput, discard each in-memory clone (needs a seeded base branch)
+forgemark $FORGE -token-file ~/.forge-token -repos org/repo \
+  -strategy clone -clone-depth 1 -concurrency 8,32 -duration 2m
 
 # Session: clone + push 5 checkpoints, abandon, repeat (needs a seeded base branch)
 forgemark $FORGE -token-file ~/.forge-token -repos org/repo \
@@ -143,13 +151,14 @@ comparison, point `-remote` at a **GitHub Enterprise Server** you control.
 | `-token-file` | — | file holding the credential secret; `-` reads stdin (else `$ACCESS_TOKEN`) |
 | `-user` | `x-access-token` | basic-auth username (token forges ignore it) |
 | `-repos` / `-repo-pattern`+`-repo-count` | — | target repo path(s), appended verbatim; `-repo-pattern` expands `{n}` to `1..N` |
-| `-strategy` | `branch` | `branch` \| `repo` \| `session` |
+| `-strategy` | `branch` | `branch` \| `repo` \| `clone` \| `session` |
 | `-branch-prefix` | — | prepended verbatim to branch names, before the run ID (e.g. `bench/` → `refs/heads/bench/fm...`); groups branches for easy cleanup |
 | `-concurrency` | `1,8,32,128` | swept sequentially, one row each |
 | `-duration` / `-warmup` | `60s` / `10s` | measured window / discarded ramp |
-| `-files-min`/`-files-max`/`-file-size` | `1`/`10`/`2048` | commit shape |
+| `-files-min`/`-files-max`/`-file-size` | `1`/`10`/`2048` | commit shape; ignored by `clone` |
 | `-object-format` | `auto` | `sha1` \| `sha256`; `auto` probes the Entire advertisement (generic/github default sha1) |
-| `-session-commits`/`-clone-depth`/`-base-ref` | `5`/`1`/default | session strategy knobs |
+| `-session-commits` | `5` | session strategy checkpoints per cloned session |
+| `-clone-depth`/`-base-ref` | `1`/default | clone/session strategy knobs |
 | `-insecure` | `false` | skip TLS verification (dev / self-signed hosts) |
 | `-out` | — | JSON results path (default `results/forgemark-<id>.json`) |
 
@@ -175,7 +184,9 @@ not a forge PAT.
 - **Each agent** keeps an in-memory go-git repo (object format matched to the
   remote), commits 1–10 small files per iteration, and pushes its own branch in
   a tight loop. Agents are pinned round-robin across the target's nodes.
-- **Stats**: every push attempt is timed; warm-up samples are dropped; exact
+- **Clone runs** create each shallow clone in memory and discard it after
+  recording latency, so the client side stays off disk.
+- **Stats**: every operation is timed; warm-up samples are dropped; exact
   percentiles are computed from the sorted OK-latency set.
 
 ## Caveats
@@ -185,9 +196,10 @@ not a forge PAT.
   network path, not the forge. Watch the generator's CPU stays below 100% at the
   top concurrency level, or it — not the server — is your bottleneck.
 - `branch`/`repo` leave one per-agent branch each on the target (no cleanup);
-  `session` deletes each ephemeral branch as the agent abandons it. Use
-  throwaway repos regardless. Pass `-branch-prefix` (e.g. `bench/`) to namespace
-  the branches so they're easy to find and delete on the target afterwards.
+  `session` deletes each ephemeral branch as the agent abandons it; `clone`
+  does not write refs. Use throwaway repos regardless. Pass `-branch-prefix`
+  (e.g. `bench/`) to namespace the branches so they're easy to find and delete
+  on the target afterwards.
 - `branch`/`repo` use force-push on agent-owned refs so numbers aren't polluted
   by spurious non-fast-forwards; the server still does the full receive-pack, so
   throughput is unaffected.
